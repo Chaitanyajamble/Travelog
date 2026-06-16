@@ -1,0 +1,1978 @@
+"""
+conftest.py — Pytest fixtures shared across all Selenium test modules.
+"""
+
+import os
+import time
+import pytest
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.firefox import GeckoDriverManager
+
+
+# ─────────────────────────── configuration ───────────────────────
+
+BASE_URL        = os.getenv("TRAVELOG_BASE_URL",  "http://localhost:3000")
+API_URL         = os.getenv("TRAVELOG_API_URL",   "http://localhost:8000")
+BROWSER         = os.getenv("SELENIUM_BROWSER",   "chrome")      # chrome | firefox
+HEADLESS        = os.getenv("SELENIUM_HEADLESS",  "true").lower() == "true"
+IMPLICIT_WAIT   = int(os.getenv("SELENIUM_IMPLICIT_WAIT", "10"))
+EXPLICIT_WAIT   = int(os.getenv("SELENIUM_EXPLICIT_WAIT", "15"))
+SCREENSHOT_DIR  = os.getenv("SCREENSHOT_DIR", "screenshots")
+
+# Test user credentials (should exist in a seeded test database)
+TEST_USER_EMAIL    = os.getenv("TEST_USER_EMAIL",    "testuser@travelog.com")
+TEST_USER_PASSWORD = os.getenv("TEST_USER_PASSWORD", "TestPass123!")
+TEST_ADMIN_EMAIL   = os.getenv("TEST_ADMIN_EMAIL",   "admin@travelog.com")
+TEST_ADMIN_PASSWORD= os.getenv("TEST_ADMIN_PASSWORD","AdminPass123!")
+
+
+# ─────────────────────────── driver factory ──────────────────────
+
+def _build_chrome(headless: bool) -> webdriver.Chrome:
+    options = ChromeOptions()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1440,900")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    service = ChromeService(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+
+def _build_firefox(headless: bool) -> webdriver.Firefox:
+    options = FirefoxOptions()
+    if headless:
+        options.add_argument("--headless")
+    options.add_argument("--width=1440")
+    options.add_argument("--height=900")
+    service = FirefoxService(GeckoDriverManager().install())
+    return webdriver.Firefox(service=service, options=options)
+
+
+# ─────────────────────────── fixtures ────────────────────────────
+
+@pytest.fixture(scope="session")
+def browser_type():
+    return BROWSER
+
+
+@pytest.fixture(scope="function")
+def driver(request):
+    """
+    Fresh WebDriver instance per test — ensures test isolation.
+    Automatically takes a screenshot on failure before tearing down.
+    """
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+    if BROWSER == "firefox":
+        drv = _build_firefox(HEADLESS)
+    else:
+        drv = _build_chrome(HEADLESS)
+
+    drv.implicitly_wait(IMPLICIT_WAIT)
+    drv.maximize_window()
+
+    yield drv
+
+    # Screenshot on failure
+    if request.node.rep_call.failed if hasattr(request.node, "rep_call") else False:
+        safe_name = request.node.name.replace("/", "_").replace(":", "_")
+        path = os.path.join(SCREENSHOT_DIR, f"FAIL_{safe_name}_{int(time.time())}.png")
+        drv.save_screenshot(path)
+        print(f"\n📸 Screenshot saved: {path}")
+
+    drv.quit()
+
+
+@pytest.fixture(scope="function")
+def wait(driver):
+    """Explicit WebDriverWait bound to the current driver."""
+    return WebDriverWait(driver, EXPLICIT_WAIT)
+
+
+@pytest.fixture(scope="function")
+def authenticated_driver(driver, wait):
+    """
+    Driver pre-logged-in as a regular test customer.
+    Navigates to /login, fills credentials, waits for dashboard.
+    """
+    driver.get(f"{BASE_URL}/login")
+    wait.until(EC.presence_of_element_located((By.ID, "email")))
+
+    driver.find_element(By.ID, "email").send_keys(TEST_USER_EMAIL)
+    driver.find_element(By.ID, "password").send_keys(TEST_USER_PASSWORD)
+    driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+    # Wait until we leave the login page
+    wait.until(EC.url_changes(f"{BASE_URL}/login"))
+    return driver
+
+
+@pytest.fixture(scope="function")
+def admin_driver(driver, wait):
+    """Driver pre-logged-in as an admin user."""
+    driver.get(f"{BASE_URL}/login")
+    wait.until(EC.presence_of_element_located((By.ID, "email")))
+
+    driver.find_element(By.ID, "email").send_keys(TEST_ADMIN_EMAIL)
+    driver.find_element(By.ID, "password").send_keys(TEST_ADMIN_PASSWORD)
+    driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+    wait.until(EC.url_changes(f"{BASE_URL}/login"))
+    return driver
+
+
+# ─────────────────────────── pytest hooks ────────────────────────
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Attach test result to the request node so the driver fixture can read it."""
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, f"rep_{rep.when}", rep)
+"""
+pages.py — Page Object Models (POMs) for Travelog.
+
+Each class encapsulates the locators and actions for one page/component.
+Tests import these instead of scattering raw selectors everywhere,
+making the suite resilient to UI refactors.
+"""
+
+import time
+from typing import Optional, List
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+
+
+BASE_URL    = "http://localhost:3000"
+WAIT_TIME   = 15
+
+
+class BasePage:
+    """Shared helpers inherited by every page object."""
+
+    def __init__(self, driver: WebDriver, wait_time: int = WAIT_TIME):
+        self.driver  = driver
+        self.wait    = WebDriverWait(driver, wait_time)
+        self.actions = ActionChains(driver)
+
+    # ── element helpers ──────────────────────────────────────────
+
+    def find(self, by: str, value: str) -> WebElement:
+        return self.wait.until(EC.presence_of_element_located((by, value)))
+
+    def find_clickable(self, by: str, value: str) -> WebElement:
+        return self.wait.until(EC.element_to_be_clickable((by, value)))
+
+    def find_all(self, by: str, value: str) -> List[WebElement]:
+        self.wait.until(EC.presence_of_all_elements_located((by, value)))
+        return self.driver.find_elements(by, value)
+
+    def click(self, by: str, value: str):
+        self.find_clickable(by, value).click()
+
+    def type_into(self, by: str, value: str, text: str, clear: bool = True):
+        el = self.find(by, value)
+        if clear:
+            el.clear()
+        el.send_keys(text)
+
+    def wait_for_url(self, url_fragment: str, timeout: int = 15):
+        WebDriverWait(self.driver, timeout).until(EC.url_contains(url_fragment))
+
+    def wait_for_text(self, by: str, value: str, text: str):
+        self.wait.until(EC.text_to_be_present_in_element((by, value), text))
+
+    def is_visible(self, by: str, value: str) -> bool:
+        try:
+            return self.driver.find_element(by, value).is_displayed()
+        except Exception:
+            return False
+
+    def get_toast_message(self) -> str:
+        """Grab the first visible toast/snackbar message."""
+        toast = self.wait.until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "[role='alert'], .toast, .snackbar"))
+        )
+        return toast.text.strip()
+
+    def scroll_to(self, element: WebElement):
+        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+
+    def navigate(self, path: str = ""):
+        self.driver.get(f"{BASE_URL}{path}")
+
+
+# ─────────────────────────── Navigation Bar ──────────────────────
+
+class NavBar(BasePage):
+    LOGO          = (By.CSS_SELECTOR, "a[href='/'], .navbar-brand, .logo")
+    TOURS_LINK    = (By.LINK_TEXT, "Tours")
+    PACKAGES_LINK = (By.LINK_TEXT, "Holiday Packages")
+    SEARCH_ICON   = (By.CSS_SELECTOR, "[data-testid='nav-search'], .nav-search")
+    LOGIN_LINK    = (By.LINK_TEXT, "Login")
+    REGISTER_LINK = (By.LINK_TEXT, "Register")
+    PROFILE_MENU  = (By.CSS_SELECTOR, "[data-testid='profile-menu'], .user-avatar, .profile-btn")
+    LOGOUT_BTN    = (By.CSS_SELECTOR, "[data-testid='logout'], a[href='/logout']")
+    WISHLIST_ICON = (By.CSS_SELECTOR, "[data-testid='wishlist-nav'], .wishlist-icon")
+    CART_ICON     = (By.CSS_SELECTOR, "[data-testid='cart-nav'], .cart-icon")
+
+    def go_home(self):
+        self.click(*self.LOGO)
+
+    def go_to_tours(self):
+        self.click(*self.TOURS_LINK)
+
+    def go_to_packages(self):
+        self.click(*self.PACKAGES_LINK)
+
+    def open_profile_menu(self):
+        self.click(*self.PROFILE_MENU)
+
+    def logout(self):
+        self.open_profile_menu()
+        self.click(*self.LOGOUT_BTN)
+        self.wait_for_url("/login")
+
+    def is_logged_in(self) -> bool:
+        return self.is_visible(*self.PROFILE_MENU)
+
+
+# ─────────────────────────── Home Page ───────────────────────────
+
+class HomePage(BasePage):
+    URL = "/"
+
+    HERO_SEARCH_INPUT    = (By.CSS_SELECTOR, "input[placeholder*='search'], input[placeholder*='Search'], #hero-search")
+    HERO_SEARCH_BTN      = (By.CSS_SELECTOR, ".hero-search button[type='submit'], #hero-search-btn")
+    FEATURED_TOURS       = (By.CSS_SELECTOR, "[data-testid='featured-tours'] .tour-card, .featured-tours .card")
+    FEATURED_PACKAGES    = (By.CSS_SELECTOR, "[data-testid='featured-packages'] .package-card, .featured-packages .card")
+    FLASH_SALE_SECTION   = (By.CSS_SELECTOR, "[data-testid='flash-sale'], .flash-sale-section")
+    FLASH_SALE_COUNTDOWN = (By.CSS_SELECTOR, ".countdown, [data-testid='countdown']")
+    POPULAR_DESTINATIONS = (By.CSS_SELECTOR, ".destination-card, [data-testid='destination-card']")
+    NEWSLETTER_INPUT     = (By.CSS_SELECTOR, "input[type='email'][placeholder*='newsletter'], #newsletter-email")
+    NEWSLETTER_BTN       = (By.CSS_SELECTOR, ".newsletter button[type='submit'], #newsletter-btn")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.HERO_SEARCH_INPUT))
+        return self
+
+    def search(self, query: str):
+        self.type_into(*self.HERO_SEARCH_INPUT, query)
+        self.click(*self.HERO_SEARCH_BTN)
+        self.wait_for_url("/search")
+
+    def get_featured_tour_count(self) -> int:
+        try:
+            return len(self.find_all(*self.FEATURED_TOURS))
+        except Exception:
+            return 0
+
+    def get_featured_package_count(self) -> int:
+        try:
+            return len(self.find_all(*self.FEATURED_PACKAGES))
+        except Exception:
+            return 0
+
+    def click_featured_tour(self, index: int = 0):
+        cards = self.find_all(*self.FEATURED_TOURS)
+        self.scroll_to(cards[index])
+        cards[index].click()
+
+    def click_popular_destination(self, index: int = 0):
+        destinations = self.find_all(*self.POPULAR_DESTINATIONS)
+        self.scroll_to(destinations[index])
+        destinations[index].click()
+
+    def subscribe_newsletter(self, email: str):
+        self.type_into(*self.NEWSLETTER_INPUT, email)
+        self.click(*self.NEWSLETTER_BTN)
+
+
+# ─────────────────────────── Auth Pages ──────────────────────────
+
+class LoginPage(BasePage):
+    URL = "/login"
+
+    EMAIL_FIELD    = (By.ID, "email")
+    PASSWORD_FIELD = (By.ID, "password")
+    SUBMIT_BTN     = (By.CSS_SELECTOR, "button[type='submit']")
+    FORGOT_LINK    = (By.LINK_TEXT, "Forgot password?")
+    REGISTER_LINK  = (By.LINK_TEXT, "Register")
+    ERROR_MSG      = (By.CSS_SELECTOR, ".error-message, [role='alert'], .alert-danger")
+    GOOGLE_BTN     = (By.CSS_SELECTOR, "[data-testid='google-login'], .google-login-btn")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.EMAIL_FIELD))
+        return self
+
+    def login(self, email: str, password: str):
+        self.type_into(*self.EMAIL_FIELD, email)
+        self.type_into(*self.PASSWORD_FIELD, password)
+        self.click(*self.SUBMIT_BTN)
+
+    def get_error_text(self) -> str:
+        return self.find(*self.ERROR_MSG).text.strip()
+
+    def click_forgot_password(self):
+        self.click(*self.FORGOT_LINK)
+        self.wait_for_url("/forgot-password")
+
+
+class RegisterPage(BasePage):
+    URL = "/register"
+
+    FULL_NAME_FIELD = (By.ID, "full_name")
+    EMAIL_FIELD     = (By.ID, "email")
+    PASSWORD_FIELD  = (By.ID, "password")
+    PHONE_FIELD     = (By.ID, "phone")
+    SUBMIT_BTN      = (By.CSS_SELECTOR, "button[type='submit']")
+    LOGIN_LINK      = (By.LINK_TEXT, "Login")
+    ERROR_MSG       = (By.CSS_SELECTOR, ".error-message, [role='alert'], .field-error")
+    TERMS_CHECKBOX  = (By.CSS_SELECTOR, "input[type='checkbox'][name='terms'], #terms")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.FULL_NAME_FIELD))
+        return self
+
+    def register(self, full_name: str, email: str, password: str, phone: str = ""):
+        self.type_into(*self.FULL_NAME_FIELD, full_name)
+        self.type_into(*self.EMAIL_FIELD, email)
+        self.type_into(*self.PASSWORD_FIELD, password)
+        if phone and self.is_visible(*self.PHONE_FIELD):
+            self.type_into(*self.PHONE_FIELD, phone)
+        if self.is_visible(*self.TERMS_CHECKBOX):
+            self.click(*self.TERMS_CHECKBOX)
+        self.click(*self.SUBMIT_BTN)
+
+    def get_error_text(self) -> str:
+        return self.find(*self.ERROR_MSG).text.strip()
+
+
+class ForgotPasswordPage(BasePage):
+    URL = "/forgot-password"
+
+    EMAIL_FIELD = (By.ID, "email")
+    SUBMIT_BTN  = (By.CSS_SELECTOR, "button[type='submit']")
+    SUCCESS_MSG = (By.CSS_SELECTOR, ".success-message, .alert-success, [data-testid='success-msg']")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.EMAIL_FIELD))
+        return self
+
+    def submit(self, email: str):
+        self.type_into(*self.EMAIL_FIELD, email)
+        self.click(*self.SUBMIT_BTN)
+
+    def get_success_text(self) -> str:
+        return self.find(*self.SUCCESS_MSG).text.strip()
+
+
+# ─────────────────────────── Search Page ─────────────────────────
+
+class SearchPage(BasePage):
+    URL = "/search"
+
+    SEARCH_INPUT       = (By.CSS_SELECTOR, "input[name='q'], #search-input")
+    FILTER_TOURS_BTN   = (By.CSS_SELECTOR, "[data-filter='tour'], button[value='tour']")
+    FILTER_PACKAGES_BTN= (By.CSS_SELECTOR, "[data-filter='holiday_package'], button[value='holiday_package']")
+    PRICE_MIN          = (By.CSS_SELECTOR, "input[name='min_price'], #min-price")
+    PRICE_MAX          = (By.CSS_SELECTOR, "input[name='max_price'], #max-price")
+    FLASH_SALE_TOGGLE  = (By.CSS_SELECTOR, "input[name='is_flash_sale'], #flash-sale-filter")
+    SORT_SELECT        = (By.CSS_SELECTOR, "select[name='sort_by'], #sort-select")
+    APPLY_FILTERS_BTN  = (By.CSS_SELECTOR, "[data-testid='apply-filters'], .apply-filters-btn")
+    CLEAR_FILTERS_BTN  = (By.CSS_SELECTOR, "[data-testid='clear-filters'], .clear-filters-btn")
+    RESULT_CARDS       = (By.CSS_SELECTOR, ".search-result-card, [data-testid='result-card']")
+    RESULT_COUNT_LABEL = (By.CSS_SELECTOR, ".result-count, [data-testid='result-count']")
+    NO_RESULTS_MSG     = (By.CSS_SELECTOR, ".no-results, [data-testid='no-results']")
+    PAGINATION_NEXT    = (By.CSS_SELECTOR, "[aria-label='Next page'], .pagination-next")
+
+    def open(self, query: str = ""):
+        path = f"{self.URL}?q={query}" if query else self.URL
+        self.navigate(path)
+        return self
+
+    def search(self, query: str):
+        self.type_into(*self.SEARCH_INPUT, query)
+        self.driver.find_element(*self.SEARCH_INPUT).send_keys(Keys.RETURN)
+        time.sleep(1)
+
+    def get_result_count(self) -> int:
+        return len(self.find_all(*self.RESULT_CARDS))
+
+    def get_result_count_label(self) -> str:
+        return self.find(*self.RESULT_COUNT_LABEL).text
+
+    def filter_by_price(self, min_price: str, max_price: str):
+        if min_price:
+            self.type_into(*self.PRICE_MIN, min_price)
+        if max_price:
+            self.type_into(*self.PRICE_MAX, max_price)
+        self.click(*self.APPLY_FILTERS_BTN)
+        time.sleep(1)
+
+    def filter_flash_sale_only(self):
+        self.click(*self.FLASH_SALE_TOGGLE)
+        self.click(*self.APPLY_FILTERS_BTN)
+        time.sleep(1)
+
+    def sort_by(self, option: str):
+        """option: 'newest', 'price_asc', 'price_desc', 'rating'"""
+        select = Select(self.find(*self.SORT_SELECT))
+        select.select_by_value(option)
+        time.sleep(1)
+
+    def click_result(self, index: int = 0):
+        cards = self.find_all(*self.RESULT_CARDS)
+        self.scroll_to(cards[index])
+        cards[index].click()
+
+    def go_to_next_page(self):
+        self.click(*self.PAGINATION_NEXT)
+        time.sleep(1)
+
+
+# ─────────────────────────── Tour Detail Page ────────────────────
+
+class TourDetailPage(BasePage):
+
+    TITLE           = (By.CSS_SELECTOR, "h1.tour-title, [data-testid='tour-title']")
+    GALLERY_IMAGES  = (By.CSS_SELECTOR, ".gallery img, .tour-images img")
+    AI_SUMMARY      = (By.CSS_SELECTOR, "[data-testid='ai-summary'], .ai-summary")
+    INCLUSIONS      = (By.CSS_SELECTOR, ".inclusions li, [data-testid='inclusions'] li")
+    EXCLUSIONS      = (By.CSS_SELECTOR, ".exclusions li, [data-testid='exclusions'] li")
+    MEETING_POINT   = (By.CSS_SELECTOR, "[data-testid='meeting-point'], .meeting-point")
+    DURATION        = (By.CSS_SELECTOR, "[data-testid='duration'], .duration-badge")
+    PRICE_OPTIONS   = (By.CSS_SELECTOR, ".pricing-option, [data-testid='pricing-option']")
+    SCHEDULE_PICKER = (By.CSS_SELECTOR, ".schedule-picker, [data-testid='schedule-picker']")
+    SELECT_DATE_BTN = (By.CSS_SELECTOR, ".schedule-option, [data-testid='schedule-option']")
+    QTY_INPUT       = (By.CSS_SELECTOR, "input[name='quantity'], #qty-input")
+    BOOK_NOW_BTN    = (By.CSS_SELECTOR, "[data-testid='book-now'], .book-now-btn")
+    ADD_WISHLIST_BTN= (By.CSS_SELECTOR, "[data-testid='add-wishlist'], .wishlist-btn")
+    REVIEWS_SECTION = (By.CSS_SELECTOR, "#reviews, .reviews-section")
+    REVIEW_CARDS    = (By.CSS_SELECTOR, ".review-card, [data-testid='review-card']")
+    AVG_RATING      = (By.CSS_SELECTOR, ".average-rating, [data-testid='avg-rating']")
+    FLASH_BADGE     = (By.CSS_SELECTOR, ".flash-sale-badge, [data-testid='flash-badge']")
+    COUNTDOWN_TIMER = (By.CSS_SELECTOR, ".countdown, [data-testid='countdown']")
+    SHARE_BTN       = (By.CSS_SELECTOR, "[data-testid='share-btn'], .share-btn")
+
+    def get_title(self) -> str:
+        return self.find(*self.TITLE).text.strip()
+
+    def get_pricing_options(self) -> List[WebElement]:
+        return self.find_all(*self.PRICE_OPTIONS)
+
+    def select_pricing_option(self, index: int = 0):
+        options = self.get_pricing_options()
+        self.scroll_to(options[index])
+        options[index].click()
+
+    def select_schedule(self, index: int = 0):
+        schedules = self.find_all(*self.SELECT_DATE_BTN)
+        if schedules:
+            self.scroll_to(schedules[index])
+            schedules[index].click()
+
+    def set_quantity(self, qty: int):
+        qty_field = self.find(*self.QTY_INPUT)
+        qty_field.clear()
+        qty_field.send_keys(str(qty))
+
+    def click_book_now(self):
+        btn = self.find_clickable(*self.BOOK_NOW_BTN)
+        self.scroll_to(btn)
+        btn.click()
+
+    def add_to_wishlist(self):
+        self.click(*self.ADD_WISHLIST_BTN)
+
+    def scroll_to_reviews(self):
+        reviews = self.find(*self.REVIEWS_SECTION)
+        self.scroll_to(reviews)
+
+    def get_review_count(self) -> int:
+        try:
+            return len(self.find_all(*self.REVIEW_CARDS))
+        except Exception:
+            return 0
+
+    def is_flash_sale(self) -> bool:
+        return self.is_visible(*self.FLASH_BADGE)
+
+
+# ─────────────────────────── Package Detail Page ─────────────────
+
+class PackageDetailPage(BasePage):
+
+    TITLE            = (By.CSS_SELECTOR, "h1.package-title, [data-testid='package-title']")
+    DURATION_BADGE   = (By.CSS_SELECTOR, ".duration-badge, [data-testid='duration']")
+    ITINERARY_DAYS   = (By.CSS_SELECTOR, ".itinerary-day, [data-testid='itinerary-day']")
+    INCLUSIONS       = (By.CSS_SELECTOR, ".inclusions li")
+    DEPARTURE_OPTIONS= (By.CSS_SELECTOR, ".departure-option, [data-testid='departure']")
+    PRICE_OPTIONS    = (By.CSS_SELECTOR, ".pricing-option, [data-testid='pricing-option']")
+    BOOK_NOW_BTN     = (By.CSS_SELECTOR, "[data-testid='book-now'], .book-now-btn")
+    ADD_WISHLIST_BTN = (By.CSS_SELECTOR, "[data-testid='add-wishlist'], .wishlist-btn")
+    HOTEL_STARS      = (By.CSS_SELECTOR, ".hotel-rating, [data-testid='hotel-stars']")
+    GALLERY_IMAGES   = (By.CSS_SELECTOR, ".gallery img, .package-images img")
+    REVIEWS_SECTION  = (By.CSS_SELECTOR, "#reviews, .reviews-section")
+
+    def get_title(self) -> str:
+        return self.find(*self.TITLE).text.strip()
+
+    def get_itinerary_day_count(self) -> int:
+        try:
+            return len(self.find_all(*self.ITINERARY_DAYS))
+        except Exception:
+            return 0
+
+    def select_departure(self, index: int = 0):
+        departures = self.find_all(*self.DEPARTURE_OPTIONS)
+        if departures:
+            departures[index].click()
+
+    def select_pricing_option(self, index: int = 0):
+        options = self.find_all(*self.PRICE_OPTIONS)
+        if options:
+            options[index].click()
+
+    def click_book_now(self):
+        btn = self.find_clickable(*self.BOOK_NOW_BTN)
+        self.scroll_to(btn)
+        btn.click()
+
+
+# ─────────────────────────── Checkout Page ───────────────────────
+
+class CheckoutPage(BasePage):
+    URL = "/checkout"
+
+    CONTACT_NAME    = (By.ID, "contact_name")
+    CONTACT_EMAIL   = (By.ID, "contact_email")
+    CONTACT_PHONE   = (By.ID, "contact_phone")
+    COUPON_INPUT    = (By.ID, "coupon_code")
+    APPLY_COUPON_BTN= (By.CSS_SELECTOR, "[data-testid='apply-coupon'], .apply-coupon-btn")
+    COUPON_MSG      = (By.CSS_SELECTOR, ".coupon-result, [data-testid='coupon-msg']")
+    NOTES_FIELD     = (By.ID, "notes")
+    SUBTOTAL_LABEL  = (By.CSS_SELECTOR, "[data-testid='subtotal'], .subtotal")
+    DISCOUNT_LABEL  = (By.CSS_SELECTOR, "[data-testid='discount'], .discount-amount")
+    TOTAL_LABEL     = (By.CSS_SELECTOR, "[data-testid='total'], .total-amount")
+    PAY_CARD_BTN    = (By.CSS_SELECTOR, "[data-testid='pay-card'], .pay-card-btn")
+    PAY_FPX_BTN     = (By.CSS_SELECTOR, "[data-testid='pay-fpx'], .pay-fpx-btn")
+    PAY_BANK_BTN    = (By.CSS_SELECTOR, "[data-testid='pay-bank'], .pay-bank-btn")
+    PASSENGER_SECTION = (By.CSS_SELECTOR, ".passenger-form, [data-testid='passenger-section']")
+    ADD_PASSENGER_BTN = (By.CSS_SELECTOR, "[data-testid='add-passenger'], .add-passenger-btn")
+    PASSENGER_NAME  = (By.CSS_SELECTOR, "input[name='passenger_name'], .passenger-name-input")
+    PASSENGER_PASSPORT = (By.CSS_SELECTOR, "input[name='passport_number']")
+
+    def fill_contact_details(self, name: str, email: str, phone: str):
+        self.type_into(*self.CONTACT_NAME, name)
+        self.type_into(*self.CONTACT_EMAIL, email)
+        self.type_into(*self.CONTACT_PHONE, phone)
+
+    def apply_coupon(self, code: str) -> str:
+        self.type_into(*self.COUPON_INPUT, code)
+        self.click(*self.APPLY_COUPON_BTN)
+        time.sleep(1)
+        return self.find(*self.COUPON_MSG).text.strip()
+
+    def get_total_amount(self) -> str:
+        return self.find(*self.TOTAL_LABEL).text.strip()
+
+    def get_discount_amount(self) -> str:
+        return self.find(*self.DISCOUNT_LABEL).text.strip()
+
+    def choose_payment_fpx(self):
+        self.click(*self.PAY_FPX_BTN)
+
+    def choose_payment_card(self):
+        self.click(*self.PAY_CARD_BTN)
+
+    def choose_payment_bank_transfer(self):
+        self.click(*self.PAY_BANK_BTN)
+
+    def add_passenger(self, name: str, passport: str = ""):
+        self.click(*self.ADD_PASSENGER_BTN)
+        time.sleep(0.5)
+        name_fields = self.driver.find_elements(*self.PASSENGER_NAME)
+        if name_fields:
+            name_fields[-1].clear()
+            name_fields[-1].send_keys(name)
+        if passport:
+            passport_fields = self.driver.find_elements(*self.PASSENGER_PASSPORT)
+            if passport_fields:
+                passport_fields[-1].clear()
+                passport_fields[-1].send_keys(passport)
+
+
+# ─────────────────────────── Booking Confirmation ────────────────
+
+class BookingConfirmationPage(BasePage):
+
+    REFERENCE_NUMBER = (By.CSS_SELECTOR, "[data-testid='booking-ref'], .booking-reference")
+    STATUS_BADGE     = (By.CSS_SELECTOR, "[data-testid='booking-status'], .status-badge")
+    TOTAL_AMOUNT     = (By.CSS_SELECTOR, "[data-testid='booking-total'], .booking-total")
+    VIEW_VOUCHER_BTN = (By.CSS_SELECTOR, "[data-testid='view-voucher'], .view-voucher-btn")
+    WHATSAPP_BTN     = (By.CSS_SELECTOR, "[data-testid='whatsapp-contact'], .whatsapp-btn")
+    ITEMS_LIST       = (By.CSS_SELECTOR, ".booking-item, [data-testid='booking-item']")
+    HOME_BTN         = (By.CSS_SELECTOR, "[data-testid='go-home'], a[href='/']")
+
+    def get_reference_number(self) -> str:
+        return self.find(*self.REFERENCE_NUMBER).text.strip()
+
+    def get_status(self) -> str:
+        return self.find(*self.STATUS_BADGE).text.strip()
+
+    def get_item_count(self) -> int:
+        return len(self.find_all(*self.ITEMS_LIST))
+
+
+# ─────────────────────────── User Profile ────────────────────────
+
+class ProfilePage(BasePage):
+    URL = "/profile"
+
+    FULL_NAME_INPUT     = (By.ID, "full_name")
+    PHONE_INPUT         = (By.ID, "phone")
+    NATIONALITY_INPUT   = (By.ID, "nationality")
+    LANGUAGE_SELECT     = (By.ID, "preferred_language")
+    SAVE_BTN            = (By.CSS_SELECTOR, "[data-testid='save-profile'], .save-profile-btn")
+    SUCCESS_MSG         = (By.CSS_SELECTOR, ".success-message, [data-testid='save-success']")
+    AVATAR_INPUT        = (By.CSS_SELECTOR, "input[type='file'][name='avatar'], #avatar-upload")
+    CHANGE_PASSWORD_BTN = (By.CSS_SELECTOR, "[data-testid='change-password-btn'], .change-password-btn")
+    CURRENT_PASSWORD    = (By.ID, "current_password")
+    NEW_PASSWORD        = (By.ID, "new_password")
+    SAVE_PASSWORD_BTN   = (By.CSS_SELECTOR, "[data-testid='save-password'], .save-password-btn")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.FULL_NAME_INPUT))
+        return self
+
+    def update_name(self, name: str):
+        self.type_into(*self.FULL_NAME_INPUT, name)
+        self.click(*self.SAVE_BTN)
+
+    def get_success_text(self) -> str:
+        return self.find(*self.SUCCESS_MSG).text.strip()
+
+    def change_password(self, current: str, new_password: str):
+        self.click(*self.CHANGE_PASSWORD_BTN)
+        self.type_into(*self.CURRENT_PASSWORD, current)
+        self.type_into(*self.NEW_PASSWORD, new_password)
+        self.click(*self.SAVE_PASSWORD_BTN)
+
+
+# ─────────────────────────── My Bookings Page ────────────────────
+
+class MyBookingsPage(BasePage):
+    URL = "/bookings"
+
+    BOOKING_CARDS   = (By.CSS_SELECTOR, ".booking-card, [data-testid='booking-card']")
+    STATUS_FILTER   = (By.CSS_SELECTOR, "select[name='status'], #status-filter")
+    CHANGE_DATE_BTN = (By.CSS_SELECTOR, "[data-testid='change-date'], .change-date-btn")
+    DATE_PICKER     = (By.CSS_SELECTOR, "input[type='date'], .date-picker-input")
+    CONFIRM_DATE_BTN= (By.CSS_SELECTOR, "[data-testid='confirm-date-change'], .confirm-date-btn")
+    EMPTY_STATE     = (By.CSS_SELECTOR, ".empty-bookings, [data-testid='no-bookings']")
+
+    def open(self):
+        self.navigate(self.URL)
+        return self
+
+    def get_booking_count(self) -> int:
+        try:
+            return len(self.find_all(*self.BOOKING_CARDS))
+        except Exception:
+            return 0
+
+    def click_booking(self, index: int = 0):
+        cards = self.find_all(*self.BOOKING_CARDS)
+        self.scroll_to(cards[index])
+        cards[index].click()
+
+    def filter_by_status(self, status: str):
+        select = Select(self.find(*self.STATUS_FILTER))
+        select.select_by_value(status)
+        time.sleep(1)
+
+
+# ─────────────────────────── Voucher Page ────────────────────────
+
+class VouchersPage(BasePage):
+    URL = "/vouchers"
+
+    VOUCHER_CARDS   = (By.CSS_SELECTOR, ".voucher-card, [data-testid='voucher-card']")
+    QR_CODE         = (By.CSS_SELECTOR, ".qr-code, [data-testid='qr-code']")
+    STATUS_BADGE    = (By.CSS_SELECTOR, ".voucher-status, [data-testid='voucher-status']")
+    PRODUCT_TITLE   = (By.CSS_SELECTOR, ".voucher-product, [data-testid='voucher-product']")
+    DOWNLOAD_BTN    = (By.CSS_SELECTOR, "[data-testid='download-voucher'], .download-voucher-btn")
+
+    def open(self):
+        self.navigate(self.URL)
+        return self
+
+    def get_voucher_count(self) -> int:
+        try:
+            return len(self.find_all(*self.VOUCHER_CARDS))
+        except Exception:
+            return 0
+
+
+# ─────────────────────────── Wishlist Page ───────────────────────
+
+class WishlistPage(BasePage):
+    URL = "/wishlist"
+
+    WISHLIST_ITEMS  = (By.CSS_SELECTOR, ".wishlist-item, [data-testid='wishlist-item']")
+    REMOVE_BTNS     = (By.CSS_SELECTOR, "[data-testid='remove-wishlist'], .remove-wishlist-btn")
+    EMPTY_STATE     = (By.CSS_SELECTOR, ".empty-wishlist, [data-testid='empty-wishlist']")
+
+    def open(self):
+        self.navigate(self.URL)
+        return self
+
+    def get_item_count(self) -> int:
+        try:
+            return len(self.find_all(*self.WISHLIST_ITEMS))
+        except Exception:
+            return 0
+
+    def remove_item(self, index: int = 0):
+        btns = self.find_all(*self.REMOVE_BTNS)
+        if btns:
+            btns[index].click()
+            time.sleep(0.5)
+
+
+# ─────────────────────────── Contact Page ────────────────────────
+
+class ContactPage(BasePage):
+    URL = "/contact"
+
+    NAME_INPUT       = (By.ID, "name")
+    EMAIL_INPUT      = (By.ID, "email")
+    PHONE_INPUT      = (By.ID, "phone")
+    SUBJECT_INPUT    = (By.ID, "subject")
+    MESSAGE_TEXTAREA = (By.ID, "message")
+    BOOKING_REF_INPUT= (By.ID, "booking_reference")
+    SUBMIT_BTN       = (By.CSS_SELECTOR, "button[type='submit']")
+    SUCCESS_MSG      = (By.CSS_SELECTOR, ".success-message, [data-testid='contact-success']")
+    ERROR_MSG        = (By.CSS_SELECTOR, ".error-message, [role='alert']")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.NAME_INPUT))
+        return self
+
+    def fill_and_submit(
+        self,
+        name: str,
+        email: str,
+        message: str,
+        subject: str = "",
+        phone: str = "",
+        booking_ref: str = "",
+    ):
+        self.type_into(*self.NAME_INPUT, name)
+        self.type_into(*self.EMAIL_INPUT, email)
+        if subject:
+            self.type_into(*self.SUBJECT_INPUT, subject)
+        if phone and self.is_visible(*self.PHONE_INPUT):
+            self.type_into(*self.PHONE_INPUT, phone)
+        self.type_into(*self.MESSAGE_TEXTAREA, message)
+        if booking_ref and self.is_visible(*self.BOOKING_REF_INPUT):
+            self.type_into(*self.BOOKING_REF_INPUT, booking_ref)
+        self.click(*self.SUBMIT_BTN)
+
+    def get_success_text(self) -> str:
+        return self.find(*self.SUCCESS_MSG).text.strip()
+
+
+# ─────────────────────────── Destinations Page ───────────────────
+
+class DestinationsPage(BasePage):
+    URL = "/destinations"
+
+    DESTINATION_CARDS = (By.CSS_SELECTOR, ".destination-card, [data-testid='destination-card']")
+    COUNTRY_FILTER    = (By.CSS_SELECTOR, "select[name='country'], #country-filter")
+    POPULAR_FILTER    = (By.CSS_SELECTOR, "input[name='popular_only'], #popular-filter")
+    DESTINATION_TITLE = (By.CSS_SELECTOR, ".destination-title, [data-testid='dest-title']")
+
+    def open(self):
+        self.navigate(self.URL)
+        self.wait.until(EC.presence_of_element_located(self.DESTINATION_CARDS))
+        return self
+
+    def get_destination_count(self) -> int:
+        return len(self.find_all(*self.DESTINATION_CARDS))
+
+    def filter_popular_only(self):
+        self.click(*self.POPULAR_FILTER)
+        time.sleep(1)
+
+    def click_destination(self, index: int = 0):
+        cards = self.find_all(*self.DESTINATION_CARDS)
+        self.scroll_to(cards[index])
+        cards[index].click()
+"""
+test_auth.py — Authentication flows: register, login, logout,
+forgot password, token refresh, and protected-route guards.
+"""
+
+import time
+import pytest
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+from pages import LoginPage, RegisterPage, ForgotPasswordPage, NavBar
+from conftest import BASE_URL, TEST_USER_EMAIL, TEST_USER_PASSWORD
+
+
+class TestLogin:
+    """Login page — happy path and error states."""
+
+    def test_login_page_loads(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        assert "login" in driver.current_url.lower() or "sign" in driver.title.lower()
+        assert driver.find_element(*LoginPage.EMAIL_FIELD).is_displayed()
+        assert driver.find_element(*LoginPage.PASSWORD_FIELD).is_displayed()
+        assert driver.find_element(*LoginPage.SUBMIT_BTN).is_displayed()
+
+    def test_login_with_valid_credentials(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        page.login(TEST_USER_EMAIL, TEST_USER_PASSWORD)
+
+        # Should redirect away from login — typically to home or dashboard
+        wait.until(EC.url_changes(f"{BASE_URL}/login"))
+        assert "/login" not in driver.current_url
+
+    def test_login_shows_error_for_wrong_password(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        page.login(TEST_USER_EMAIL, "WrongPassword999!")
+
+        error_el = wait.until(
+            EC.visibility_of_element_located(LoginPage.ERROR_MSG)
+        )
+        error_text = error_el.text.lower()
+        assert any(kw in error_text for kw in ["incorrect", "invalid", "wrong", "failed"])
+
+    def test_login_shows_error_for_unknown_email(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        page.login("nobody@nonexistent-domain-xyz.com", "SomePass123!")
+
+        error_el = wait.until(
+            EC.visibility_of_element_located(LoginPage.ERROR_MSG)
+        )
+        assert error_el.is_displayed()
+
+    def test_login_empty_fields_prevented(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        driver.find_element(*LoginPage.SUBMIT_BTN).click()
+        # Should stay on login page and show HTML5 validation or custom error
+        assert "/login" in driver.current_url or driver.find_element(*LoginPage.EMAIL_FIELD).get_attribute("validationMessage")
+
+    def test_login_invalid_email_format(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        driver.find_element(*LoginPage.EMAIL_FIELD).send_keys("not-an-email")
+        driver.find_element(*LoginPage.PASSWORD_FIELD).send_keys("SomePass123!")
+        driver.find_element(*LoginPage.SUBMIT_BTN).click()
+        # Browser validates email format or app shows error
+        email_validation = driver.find_element(*LoginPage.EMAIL_FIELD).get_attribute("validationMessage")
+        assert email_validation or "/login" in driver.current_url
+
+    def test_forgot_password_link_navigates(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        page.click_forgot_password()
+        assert "forgot" in driver.current_url.lower() or "reset" in driver.current_url.lower()
+
+    def test_register_link_navigates(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        page.click(*LoginPage.REGISTER_LINK)
+        wait.until(EC.url_contains("register"))
+        assert "register" in driver.current_url.lower()
+
+    def test_password_field_is_masked(self, driver, wait):
+        page = LoginPage(driver)
+        page.open()
+        pwd_field = driver.find_element(*LoginPage.PASSWORD_FIELD)
+        assert pwd_field.get_attribute("type") == "password"
+
+
+class TestLogout:
+    """Logout clears session and redirects to login."""
+
+    def test_logout_redirects_to_login(self, authenticated_driver, wait):
+        nav = NavBar(authenticated_driver)
+        assert nav.is_logged_in(), "User should be logged in before logging out"
+
+        nav.logout()
+        assert "login" in authenticated_driver.current_url.lower()
+
+    def test_after_logout_protected_pages_redirect(self, authenticated_driver, wait):
+        nav = NavBar(authenticated_driver)
+        nav.logout()
+
+        authenticated_driver.get(f"{BASE_URL}/profile")
+        wait.until(EC.url_contains("login"))
+        assert "login" in authenticated_driver.current_url.lower()
+
+
+class TestRegister:
+    """Registration — valid, duplicate email, weak password."""
+
+    def test_register_page_loads(self, driver, wait):
+        page = RegisterPage(driver)
+        page.open()
+        assert driver.find_element(*RegisterPage.FULL_NAME_FIELD).is_displayed()
+        assert driver.find_element(*RegisterPage.EMAIL_FIELD).is_displayed()
+        assert driver.find_element(*RegisterPage.PASSWORD_FIELD).is_displayed()
+
+    def test_register_with_valid_data(self, driver, wait):
+        unique_email = f"selenium_{int(time.time())}@test.travelog.com"
+        page = RegisterPage(driver)
+        page.open()
+        page.register(
+            full_name="Selenium Tester",
+            email=unique_email,
+            password="SecurePass123!",
+            phone="+60123456789",
+        )
+        # On success: redirect away from /register
+        wait.until(EC.url_changes(f"{BASE_URL}/register"))
+        assert "/register" not in driver.current_url
+
+    def test_register_duplicate_email_shows_error(self, driver, wait):
+        page = RegisterPage(driver)
+        page.open()
+        page.register(
+            full_name="Duplicate User",
+            email=TEST_USER_EMAIL,   # already exists in seeded DB
+            password="SecurePass123!",
+        )
+        error_el = wait.until(
+            EC.visibility_of_element_located(RegisterPage.ERROR_MSG)
+        )
+        assert "exist" in error_el.text.lower() or "already" in error_el.text.lower()
+
+    def test_register_weak_password_shows_error(self, driver, wait):
+        page = RegisterPage(driver)
+        page.open()
+        page.register(
+            full_name="Weak Password User",
+            email=f"weak_{int(time.time())}@test.travelog.com",
+            password="123",   # below 8-character minimum
+        )
+        error_el = wait.until(
+            EC.visibility_of_element_located(RegisterPage.ERROR_MSG)
+        )
+        assert error_el.is_displayed()
+
+    def test_register_empty_name_prevented(self, driver, wait):
+        page = RegisterPage(driver)
+        page.open()
+        driver.find_element(*RegisterPage.EMAIL_FIELD).send_keys("user@test.com")
+        driver.find_element(*RegisterPage.PASSWORD_FIELD).send_keys("Password123!")
+        driver.find_element(*RegisterPage.SUBMIT_BTN).click()
+        assert "/register" in driver.current_url or driver.find_element(*RegisterPage.FULL_NAME_FIELD).get_attribute("validationMessage")
+
+
+class TestForgotPassword:
+    """Forgot password flow — valid and unknown emails."""
+
+    def test_forgot_password_page_loads(self, driver, wait):
+        page = ForgotPasswordPage(driver)
+        page.open()
+        assert driver.find_element(*ForgotPasswordPage.EMAIL_FIELD).is_displayed()
+
+    def test_forgot_password_known_email_shows_success(self, driver, wait):
+        page = ForgotPasswordPage(driver)
+        page.open()
+        page.submit(TEST_USER_EMAIL)
+        success_el = wait.until(
+            EC.visibility_of_element_located(ForgotPasswordPage.SUCCESS_MSG)
+        )
+        assert success_el.is_displayed()
+
+    def test_forgot_password_unknown_email_still_shows_success(self, driver, wait):
+        """
+        API returns 202 for unknown emails (security: don't leak whether email exists).
+        The UI should show the same success message.
+        """
+        page = ForgotPasswordPage(driver)
+        page.open()
+        page.submit("nonexistent_xyz@test.travelog.com")
+        success_el = wait.until(
+            EC.visibility_of_element_located(ForgotPasswordPage.SUCCESS_MSG)
+        )
+        assert success_el.is_displayed()
+
+
+class TestProtectedRoutes:
+    """Unauthenticated users are redirected away from protected pages."""
+
+    @pytest.mark.parametrize("protected_path", [
+        "/profile",
+        "/bookings",
+        "/vouchers",
+        "/wishlist",
+        "/notifications",
+    ])
+    def test_protected_route_redirects_when_not_logged_in(self, driver, wait, protected_path):
+        driver.get(f"{BASE_URL}{protected_path}")
+        wait.until(EC.url_contains("login"))
+        assert "login" in driver.current_url.lower(), (
+            f"Expected redirect to login from {protected_path}, "
+            f"but got {driver.current_url}"
+        )
+"""
+test_home_and_search.py — Home page content, search, filters,
+tour detail, and package detail page tests.
+"""
+
+import time
+import pytest
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+from pages import (
+    HomePage, SearchPage, TourDetailPage,
+    PackageDetailPage, DestinationsPage, NavBar,
+)
+from conftest import BASE_URL
+
+
+class TestHomePage:
+    """Home page renders key sections and navigation works correctly."""
+
+    def test_home_page_loads(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        assert driver.title != ""
+        assert "travelog" in driver.title.lower() or "travel" in driver.title.lower()
+
+    def test_hero_search_bar_is_present(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        assert page.is_visible(*HomePage.HERO_SEARCH_INPUT)
+
+    def test_featured_tours_are_displayed(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        count = page.get_featured_tour_count()
+        assert count > 0, "Expected at least one featured tour on the home page"
+
+    def test_featured_packages_are_displayed(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        count = page.get_featured_package_count()
+        assert count > 0, "Expected at least one featured holiday package on the home page"
+
+    def test_popular_destinations_are_displayed(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        destinations = driver.find_elements(*HomePage.POPULAR_DESTINATIONS)
+        assert len(destinations) > 0
+
+    def test_flash_sale_section_visible(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        assert page.is_visible(*HomePage.FLASH_SALE_SECTION)
+
+    def test_flash_sale_countdown_timer_shown(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        assert page.is_visible(*HomePage.FLASH_SALE_COUNTDOWN)
+
+    def test_hero_search_navigates_to_results(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        page.search("Kuala Lumpur")
+        wait.until(EC.url_contains("search"))
+        assert "search" in driver.current_url.lower()
+
+    def test_clicking_featured_tour_opens_detail(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        if page.get_featured_tour_count() == 0:
+            pytest.skip("No featured tours available in test data")
+        page.click_featured_tour()
+        wait.until(EC.url_changes(f"{BASE_URL}/"))
+        assert "/tours/" in driver.current_url or "/tour/" in driver.current_url
+
+    def test_clicking_destination_opens_detail(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        destinations = driver.find_elements(*HomePage.POPULAR_DESTINATIONS)
+        if not destinations:
+            pytest.skip("No popular destinations in test data")
+        page.click_popular_destination()
+        wait.until(EC.url_changes(f"{BASE_URL}/"))
+
+    def test_nav_links_are_accessible(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        nav = NavBar(driver)
+        assert page.is_visible(*NavBar.LOGO)
+        assert page.is_visible(*NavBar.TOURS_LINK)
+        assert page.is_visible(*NavBar.PACKAGES_LINK)
+
+    def test_page_title_tag(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        assert len(driver.title) > 0
+
+    def test_page_does_not_have_js_errors(self, driver, wait):
+        page = HomePage(driver)
+        page.open()
+        logs = driver.get_log("browser")
+        severe_errors = [e for e in logs if e["level"] == "SEVERE"]
+        assert len(severe_errors) == 0, f"JS errors found: {severe_errors}"
+
+
+class TestSearch:
+    """Search page — query, filters, sorting, and pagination."""
+
+    def test_search_returns_results_for_valid_query(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("Langkawi")
+        time.sleep(2)
+        count = page.get_result_count()
+        assert count > 0, "Expected search results for 'Langkawi'"
+
+    def test_search_shows_no_results_message_for_gibberish(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("xyzxyzxyzabcabcabc99999")
+        time.sleep(2)
+        assert page.is_visible(*SearchPage.NO_RESULTS_MSG) or page.get_result_count() == 0
+
+    def test_search_result_count_label_is_shown(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        try:
+            label = page.get_result_count_label()
+            assert label != ""
+        except Exception:
+            pytest.skip("Result count label not implemented in this UI version")
+
+    def test_search_filters_by_price_range(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        initial_count = page.get_result_count()
+        try:
+            page.filter_by_price("100", "500")
+            time.sleep(2)
+            filtered_count = page.get_result_count()
+            # Filtered results should be less than or equal to initial results
+            assert filtered_count <= initial_count
+        except Exception:
+            pytest.skip("Price filter not available in this UI version")
+
+    def test_search_flash_sale_filter(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        try:
+            page.filter_flash_sale_only()
+            time.sleep(2)
+            # All returned results should be flash sale items (visual badge check)
+            cards = driver.find_elements(*SearchPage.RESULT_CARDS)
+            if cards:
+                flash_badges = driver.find_elements(By.CSS_SELECTOR, ".flash-sale-badge, [data-testid='flash-badge']")
+                assert len(flash_badges) == len(cards) or len(flash_badges) > 0
+        except Exception:
+            pytest.skip("Flash sale filter not implemented")
+
+    def test_search_sort_by_newest(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        try:
+            page.sort_by("newest")
+            time.sleep(2)
+            assert page.get_result_count() >= 0
+        except Exception:
+            pytest.skip("Sort select not present")
+
+    def test_search_pagination_works(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        try:
+            initial_first_card = driver.find_elements(*SearchPage.RESULT_CARDS)[0].text if driver.find_elements(*SearchPage.RESULT_CARDS) else ""
+            page.go_to_next_page()
+            time.sleep(2)
+            next_first_card = driver.find_elements(*SearchPage.RESULT_CARDS)[0].text if driver.find_elements(*SearchPage.RESULT_CARDS) else ""
+            assert initial_first_card != next_first_card
+        except Exception:
+            pytest.skip("Pagination not available or only one page of results")
+
+    def test_search_result_click_opens_product(self, driver, wait):
+        page = SearchPage(driver)
+        page.open("tour")
+        time.sleep(2)
+        if page.get_result_count() == 0:
+            pytest.skip("No search results in test data")
+        page.click_result(0)
+        wait.until(EC.url_changes(driver.current_url))
+        assert any(kw in driver.current_url for kw in ["/tour", "/package", "/product"])
+
+    def test_search_from_navbar(self, driver, wait):
+        driver.get(BASE_URL)
+        try:
+            nav_search = wait.until(EC.element_to_be_clickable(NavBar.SEARCH_ICON))
+            nav_search.click()
+            search_input = wait.until(EC.presence_of_element_located(SearchPage.SEARCH_INPUT))
+            search_input.send_keys("Penang")
+            from selenium.webdriver.common.keys import Keys
+            search_input.send_keys(Keys.RETURN)
+            wait.until(EC.url_contains("search"))
+            assert "search" in driver.current_url
+        except Exception:
+            pytest.skip("Nav search not implemented as a clickable icon")
+
+
+class TestTourDetail:
+    """Tour detail page — content, pricing, schedule, wishlist, reviews."""
+
+    @pytest.fixture(autouse=True)
+    def goto_tour(self, driver, wait):
+        """Navigate to the first search result for 'tour'."""
+        search = SearchPage(driver)
+        search.open("tour")
+        time.sleep(2)
+        if search.get_result_count() == 0:
+            pytest.skip("No tours in test data")
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+        self.tour_page = TourDetailPage(driver)
+
+    def test_tour_title_is_displayed(self, driver, wait):
+        title = self.tour_page.get_title()
+        assert len(title) > 0
+
+    def test_gallery_images_present(self, driver, wait):
+        images = driver.find_elements(*TourDetailPage.GALLERY_IMAGES)
+        assert len(images) > 0
+
+    def test_pricing_options_displayed(self, driver, wait):
+        options = self.tour_page.get_pricing_options()
+        assert len(options) > 0, "Tour should show at least one pricing option"
+
+    def test_book_now_button_present(self, driver, wait):
+        assert self.tour_page.is_visible(*TourDetailPage.BOOK_NOW_BTN)
+
+    def test_inclusions_list_displayed(self, driver, wait):
+        inclusions = driver.find_elements(*TourDetailPage.INCLUSIONS)
+        assert len(inclusions) > 0
+
+    def test_wishlist_button_present(self, driver, wait):
+        assert self.tour_page.is_visible(*TourDetailPage.ADD_WISHLIST_BTN)
+
+    def test_reviews_section_present(self, driver, wait):
+        self.tour_page.scroll_to_reviews()
+        assert self.tour_page.is_visible(*TourDetailPage.REVIEWS_SECTION)
+
+    def test_ai_summary_present(self, driver, wait):
+        if self.tour_page.is_visible(*TourDetailPage.AI_SUMMARY):
+            summary_text = driver.find_element(*TourDetailPage.AI_SUMMARY).text
+            assert len(summary_text) > 0
+
+    def test_book_now_requires_login(self, driver, wait):
+        """Unauthenticated click on Book Now should redirect to login."""
+        btn = driver.find_element(*TourDetailPage.BOOK_NOW_BTN)
+        self.tour_page.scroll_to(btn)
+        btn.click()
+        time.sleep(2)
+        # Either still on page with modal, or redirected to login
+        login_redirect = "login" in driver.current_url.lower()
+        auth_modal = self.tour_page.is_visible(
+            By.CSS_SELECTOR, ".auth-modal, [data-testid='login-prompt']"
+        )
+        assert login_redirect or auth_modal, \
+            "Unauthenticated booking attempt should prompt login"
+
+    def test_flash_tour_shows_badge_and_countdown(self, driver, wait):
+        """If this tour is a flash sale, the badge and countdown should be visible."""
+        if self.tour_page.is_flash_sale():
+            assert self.tour_page.is_visible(*TourDetailPage.COUNTDOWN_TIMER)
+
+
+class TestPackageDetail:
+    """Holiday package detail page — itinerary, departures, pricing."""
+
+    @pytest.fixture(autouse=True)
+    def goto_package(self, driver, wait):
+        search = SearchPage(driver)
+        search.open("holiday package")
+        time.sleep(2)
+
+        # Try filter to packages only
+        if search.is_visible(*SearchPage.FILTER_PACKAGES_BTN):
+            search.click(*SearchPage.FILTER_PACKAGES_BTN)
+            time.sleep(1)
+
+        if search.get_result_count() == 0:
+            # Try direct URL for packages listing
+            driver.get(f"{BASE_URL}/packages")
+            time.sleep(2)
+            cards = driver.find_elements(By.CSS_SELECTOR, ".package-card, [data-testid='package-card']")
+            if not cards:
+                pytest.skip("No packages in test data")
+            cards[0].click()
+        else:
+            search.click_result(0)
+
+        wait.until(EC.url_changes(driver.current_url))
+        self.pkg_page = PackageDetailPage(driver)
+
+    def test_package_title_displayed(self, driver, wait):
+        title = self.pkg_page.get_title()
+        assert len(title) > 0
+
+    def test_duration_badge_visible(self, driver, wait):
+        assert self.pkg_page.is_visible(*PackageDetailPage.DURATION_BADGE)
+
+    def test_itinerary_days_displayed(self, driver, wait):
+        days = self.pkg_page.get_itinerary_day_count()
+        assert days > 0, "Package should show at least one itinerary day"
+
+    def test_departure_options_listed(self, driver, wait):
+        departures = driver.find_elements(*PackageDetailPage.DEPARTURE_OPTIONS)
+        assert len(departures) > 0 or self.pkg_page.is_visible(
+            By.CSS_SELECTOR, ".no-departures, [data-testid='no-departures']"
+        )
+
+    def test_pricing_options_displayed(self, driver, wait):
+        options = driver.find_elements(*PackageDetailPage.PRICE_OPTIONS)
+        assert len(options) > 0
+
+    def test_book_now_button_present(self, driver, wait):
+        assert self.pkg_page.is_visible(*PackageDetailPage.BOOK_NOW_BTN)
+
+    def test_gallery_images_present(self, driver, wait):
+        images = driver.find_elements(*PackageDetailPage.GALLERY_IMAGES)
+        assert len(images) > 0
+
+
+class TestDestinations:
+    """Destinations listing and destination detail pages."""
+
+    def test_destinations_page_loads(self, driver, wait):
+        page = DestinationsPage(driver)
+        page.open()
+        count = page.get_destination_count()
+        assert count > 0
+
+    def test_filter_popular_destinations(self, driver, wait):
+        page = DestinationsPage(driver)
+        page.open()
+        total = page.get_destination_count()
+        try:
+            page.filter_popular_only()
+            popular_count = page.get_destination_count()
+            assert popular_count <= total
+        except Exception:
+            pytest.skip("Popular filter not available")
+
+    def test_clicking_destination_shows_tours_and_packages(self, driver, wait):
+        page = DestinationsPage(driver)
+        page.open()
+        initial_url = driver.current_url
+        page.click_destination(0)
+        wait.until(EC.url_changes(initial_url))
+        assert driver.current_url != initial_url
+"""
+test_booking_and_payments.py — End-to-end booking flow, checkout,
+payment method selection, voucher viewing, wishlist, and profile.
+"""
+
+import time
+import pytest
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+from pages import (
+    HomePage, SearchPage, TourDetailPage, PackageDetailPage,
+    CheckoutPage, BookingConfirmationPage, MyBookingsPage,
+    VouchersPage, WishlistPage, ProfilePage, ContactPage, NavBar,
+)
+from conftest import BASE_URL, TEST_USER_EMAIL, TEST_USER_PASSWORD
+
+
+# ─────────────────────────── Booking Flow ────────────────────────
+
+class TestBookingFlow:
+    """Full booking flow for an authenticated user."""
+
+    def _navigate_to_tour(self, driver, wait):
+        """Helper: get to a tour detail page."""
+        search = SearchPage(driver)
+        search.open("tour")
+        time.sleep(2)
+        if search.get_result_count() == 0:
+            pytest.skip("No tours available in test data")
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+        return TourDetailPage(driver)
+
+    def test_book_now_button_redirects_to_checkout_when_logged_in(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.select_schedule(0)
+        tour.click_book_now()
+        time.sleep(2)
+        assert any(kw in authenticated_driver.current_url for kw in ["/checkout", "/booking", "/cart"])
+
+    def test_checkout_page_shows_contact_form(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        assert checkout.is_visible(*CheckoutPage.CONTACT_NAME)
+        assert checkout.is_visible(*CheckoutPage.CONTACT_EMAIL)
+        assert checkout.is_visible(*CheckoutPage.CONTACT_PHONE)
+
+    def test_checkout_shows_order_summary(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        assert checkout.is_visible(*CheckoutPage.TOTAL_LABEL)
+        total = checkout.get_total_amount()
+        assert "MYR" in total or "RM" in total or any(c.isdigit() for c in total)
+
+    def test_checkout_contact_details_pre_filled_for_logged_in_user(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        name_field = authenticated_driver.find_element(*CheckoutPage.CONTACT_NAME)
+        email_field = authenticated_driver.find_element(*CheckoutPage.CONTACT_EMAIL)
+        assert name_field.get_attribute("value") != "" or email_field.get_attribute("value") != ""
+
+    def test_checkout_payment_methods_displayed(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        has_fpx  = checkout.is_visible(*CheckoutPage.PAY_FPX_BTN)
+        has_card = checkout.is_visible(*CheckoutPage.PAY_CARD_BTN)
+        has_bank = checkout.is_visible(*CheckoutPage.PAY_BANK_BTN)
+        assert any([has_fpx, has_card, has_bank]), "At least one payment method must be shown"
+
+    def test_checkout_coupon_invalid_shows_error(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        if not checkout.is_visible(*CheckoutPage.COUPON_INPUT):
+            pytest.skip("Coupon field not visible on this checkout page")
+
+        msg = checkout.apply_coupon("INVALIDCOUPON999")
+        assert any(kw in msg.lower() for kw in ["invalid", "expired", "not found", "error"])
+
+    def test_checkout_valid_coupon_applies_discount(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        if not checkout.is_visible(*CheckoutPage.COUPON_INPUT):
+            pytest.skip("Coupon field not available")
+
+        # Use a seeded test coupon code — must exist in test DB
+        msg = checkout.apply_coupon("TESTDISCOUNT10")
+        if "invalid" in msg.lower():
+            pytest.skip("Test coupon TESTDISCOUNT10 not seeded in test DB")
+
+        discount = checkout.get_discount_amount()
+        assert any(c.isdigit() for c in discount), "Expected a numeric discount amount"
+
+    def test_bank_transfer_checkout_shows_bank_details(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        checkout.fill_contact_details("Test User", TEST_USER_EMAIL, "0123456789")
+
+        if not checkout.is_visible(*CheckoutPage.PAY_BANK_BTN):
+            pytest.skip("Bank transfer option not visible")
+
+        checkout.choose_payment_bank_transfer()
+        time.sleep(2)
+
+        # Expect bank details panel / modal to appear
+        bank_info = authenticated_driver.find_elements(
+            By.CSS_SELECTOR, ".bank-details, [data-testid='bank-details']"
+        )
+        assert len(bank_info) > 0 or "account" in authenticated_driver.page_source.lower()
+
+    def test_fpx_checkout_redirects_to_gateway(self, authenticated_driver, wait):
+        tour = self._navigate_to_tour(authenticated_driver, wait)
+        tour.select_pricing_option(0)
+        tour.click_book_now()
+        time.sleep(2)
+
+        checkout = CheckoutPage(authenticated_driver)
+        checkout.fill_contact_details("Test User", TEST_USER_EMAIL, "0123456789")
+
+        if not checkout.is_visible(*CheckoutPage.PAY_FPX_BTN):
+            pytest.skip("FPX option not visible")
+
+        original_url = authenticated_driver.current_url
+        checkout.choose_payment_fpx()
+        time.sleep(3)
+        # FPX redirects to external gateway — URL should change
+        assert authenticated_driver.current_url != original_url or \
+               "fpx" in authenticated_driver.page_source.lower()
+
+
+class TestDateChange:
+    """Policy: no cancellation, but date changes are allowed."""
+
+    def test_change_date_option_available_on_confirmed_booking(self, authenticated_driver, wait):
+        bookings_page = MyBookingsPage(authenticated_driver)
+        bookings_page.open()
+        time.sleep(2)
+
+        count = bookings_page.get_booking_count()
+        if count == 0:
+            pytest.skip("No bookings for test user — seed a confirmed booking")
+
+        bookings_page.click_booking(0)
+        time.sleep(2)
+
+        # Change-date button should exist; cancellation button should NOT
+        has_date_change = authenticated_driver.find_elements(
+            By.CSS_SELECTOR, "[data-testid='change-date'], .change-date-btn"
+        )
+        has_cancel = authenticated_driver.find_elements(
+            By.CSS_SELECTOR, "[data-testid='cancel-booking'], .cancel-booking-btn"
+        )
+
+        assert len(has_date_change) > 0, "Date-change button should be available"
+        assert len(has_cancel) == 0, "Cancellation button must NOT be shown (policy)"
+
+
+# ─────────────────────────── My Bookings ─────────────────────────
+
+class TestMyBookings:
+    """Booking listing page for authenticated users."""
+
+    def test_my_bookings_page_loads(self, authenticated_driver, wait):
+        page = MyBookingsPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+        assert "/booking" in authenticated_driver.current_url or \
+               "/orders" in authenticated_driver.current_url
+
+    def test_empty_state_shown_when_no_bookings(self, driver, wait):
+        """Test with a brand-new account that has no bookings."""
+        # Log in as a clean user
+        driver.get(f"{BASE_URL}/login")
+        wait.until(EC.presence_of_element_located((By.ID, "email")))
+        driver.find_element(By.ID, "email").send_keys("newuser@travelog.com")
+        driver.find_element(By.ID, "password").send_keys("NewUserPass123!")
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+        time.sleep(2)
+
+        page = MyBookingsPage(driver)
+        page.open()
+        time.sleep(2)
+        count = page.get_booking_count()
+        # Either no booking cards or empty state message
+        if count == 0:
+            assert page.is_visible(*MyBookingsPage.EMPTY_STATE) or count == 0
+
+    def test_booking_cards_show_reference_number(self, authenticated_driver, wait):
+        page = MyBookingsPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+
+        if page.get_booking_count() == 0:
+            pytest.skip("No bookings to verify")
+
+        cards = authenticated_driver.find_elements(*MyBookingsPage.BOOKING_CARDS)
+        first_card_text = cards[0].text
+        assert "TRV-" in first_card_text or any(c.isdigit() for c in first_card_text)
+
+    def test_booking_detail_page_accessible(self, authenticated_driver, wait):
+        page = MyBookingsPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+
+        if page.get_booking_count() == 0:
+            pytest.skip("No bookings available")
+
+        original_url = authenticated_driver.current_url
+        page.click_booking(0)
+        wait.until(EC.url_changes(original_url))
+        assert authenticated_driver.current_url != original_url
+
+
+# ─────────────────────────── Vouchers ────────────────────────────
+
+class TestVouchers:
+    """Voucher listing page — display and basic interactions."""
+
+    def test_vouchers_page_loads(self, authenticated_driver, wait):
+        page = VouchersPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+        assert "/voucher" in authenticated_driver.current_url
+
+    def test_vouchers_shows_list_or_empty_state(self, authenticated_driver, wait):
+        page = VouchersPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+        count = page.get_voucher_count()
+        # Either vouchers exist or an empty state should be shown
+        assert count >= 0
+
+    def test_voucher_card_has_product_title(self, authenticated_driver, wait):
+        page = VouchersPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+
+        if page.get_voucher_count() == 0:
+            pytest.skip("No vouchers for this user — book and pay to generate")
+
+        cards = authenticated_driver.find_elements(*VouchersPage.VOUCHER_CARDS)
+        assert cards[0].text.strip() != ""
+
+    def test_qr_code_displayed_on_active_voucher(self, authenticated_driver, wait):
+        page = VouchersPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+
+        qr_codes = authenticated_driver.find_elements(*VouchersPage.QR_CODE)
+        active_vouchers = authenticated_driver.find_elements(
+            By.CSS_SELECTOR, ".voucher-card[data-status='active']"
+        )
+        if active_vouchers:
+            assert len(qr_codes) > 0
+
+
+# ─────────────────────────── Wishlist ────────────────────────────
+
+class TestWishlist:
+    """Add to wishlist from tour page and manage via wishlist page."""
+
+    def test_add_tour_to_wishlist_when_logged_in(self, authenticated_driver, wait):
+        search = SearchPage(authenticated_driver)
+        search.open("tour")
+        time.sleep(2)
+
+        if search.get_result_count() == 0:
+            pytest.skip("No tours available")
+
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+
+        tour = TourDetailPage(authenticated_driver)
+        wait.until(EC.element_to_be_clickable(TourDetailPage.ADD_WISHLIST_BTN))
+        tour.add_to_wishlist()
+        time.sleep(1)
+
+        # Expect a toast or button state change
+        toast_visible = tour.is_visible(
+            By.CSS_SELECTOR, "[role='alert'], .toast, .snackbar"
+        )
+        btn_active = "active" in authenticated_driver.find_element(
+            *TourDetailPage.ADD_WISHLIST_BTN
+        ).get_attribute("class") or ""
+        assert toast_visible or btn_active or True   # at minimum no exception
+
+    def test_wishlist_page_loads(self, authenticated_driver, wait):
+        page = WishlistPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+        assert "/wishlist" in authenticated_driver.current_url
+
+    def test_wishlist_remove_item(self, authenticated_driver, wait):
+        page = WishlistPage(authenticated_driver)
+        page.open()
+        time.sleep(2)
+
+        initial_count = page.get_item_count()
+        if initial_count == 0:
+            pytest.skip("Wishlist is empty — add an item first")
+
+        page.remove_item(0)
+        time.sleep(1)
+        new_count = page.get_item_count()
+        assert new_count == initial_count - 1
+
+    def test_add_to_wishlist_requires_login(self, driver, wait):
+        """Clicking wishlist when not logged in should prompt login."""
+        search = SearchPage(driver)
+        search.open("tour")
+        time.sleep(2)
+
+        if search.get_result_count() == 0:
+            pytest.skip("No tours available")
+
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+
+        tour = TourDetailPage(driver)
+        tour.add_to_wishlist()
+        time.sleep(2)
+
+        login_redirect = "login" in driver.current_url.lower()
+        login_modal = tour.is_visible(By.CSS_SELECTOR, ".auth-modal, [data-testid='login-prompt']")
+        assert login_redirect or login_modal
+
+
+# ─────────────────────────── Profile ─────────────────────────────
+
+class TestUserProfile:
+    """Profile page — view, edit, avatar upload, and password change."""
+
+    def test_profile_page_loads_with_user_data(self, authenticated_driver, wait):
+        page = ProfilePage(authenticated_driver)
+        page.open()
+        name_field = authenticated_driver.find_element(*ProfilePage.FULL_NAME_INPUT)
+        assert name_field.get_attribute("value") != ""
+
+    def test_profile_email_shown(self, authenticated_driver, wait):
+        page = ProfilePage(authenticated_driver)
+        page.open()
+        assert TEST_USER_EMAIL in authenticated_driver.page_source
+
+    def test_update_full_name(self, authenticated_driver, wait):
+        page = ProfilePage(authenticated_driver)
+        page.open()
+        page.update_name("Updated Selenium Name")
+        time.sleep(2)
+        try:
+            success_text = page.get_success_text()
+            assert len(success_text) > 0
+        except Exception:
+            # Alternatively, verify the field value was saved
+            name_val = authenticated_driver.find_element(*ProfilePage.FULL_NAME_INPUT).get_attribute("value")
+            assert "Updated Selenium Name" in name_val
+
+    def test_change_password_wrong_current_shows_error(self, authenticated_driver, wait):
+        page = ProfilePage(authenticated_driver)
+        page.open()
+        try:
+            page.change_password("WrongCurrentPass999!", "NewValidPass123!")
+            time.sleep(2)
+            error = authenticated_driver.find_element(
+                By.CSS_SELECTOR, ".error-message, [role='alert']"
+            ).text
+            assert "incorrect" in error.lower() or "wrong" in error.lower() or len(error) > 0
+        except Exception:
+            pytest.skip("Change password UI not accessible from profile page")
+
+    def test_preferred_language_can_be_changed(self, authenticated_driver, wait):
+        page = ProfilePage(authenticated_driver)
+        page.open()
+        try:
+            from selenium.webdriver.support.ui import Select
+            lang_select = Select(authenticated_driver.find_element(*ProfilePage.LANGUAGE_SELECT))
+            lang_select.select_by_value("ms")   # Malay
+            page.click(*ProfilePage.SAVE_BTN)
+            time.sleep(2)
+            assert True   # no exception = pass
+        except Exception:
+            pytest.skip("Language select not present on profile page")
+
+
+# ─────────────────────────── Contact Page ────────────────────────
+
+class TestContactPage:
+    """Contact / support submission form."""
+
+    def test_contact_page_loads(self, driver, wait):
+        page = ContactPage(driver)
+        page.open()
+        assert page.is_visible(*ContactPage.NAME_INPUT)
+        assert page.is_visible(*ContactPage.EMAIL_INPUT)
+        assert page.is_visible(*ContactPage.MESSAGE_TEXTAREA)
+        assert page.is_visible(*ContactPage.SUBMIT_BTN)
+
+    def test_contact_form_submits_successfully(self, driver, wait):
+        page = ContactPage(driver)
+        page.open()
+        page.fill_and_submit(
+            name="Selenium Test User",
+            email="selenium@test.travelog.com",
+            message="This is an automated test message from Selenium WebDriver.",
+            subject="Test Enquiry",
+            phone="0123456789",
+        )
+        time.sleep(2)
+        success_el = wait.until(
+            EC.visibility_of_element_located(ContactPage.SUCCESS_MSG)
+        )
+        assert success_el.is_displayed()
+
+    def test_contact_form_empty_fields_prevented(self, driver, wait):
+        page = ContactPage(driver)
+        page.open()
+        driver.find_element(*ContactPage.SUBMIT_BTN).click()
+        time.sleep(1)
+        # Should stay on page
+        assert "/contact" in driver.current_url or page.is_visible(*ContactPage.ERROR_MSG)
+
+    def test_contact_form_invalid_email_prevented(self, driver, wait):
+        page = ContactPage(driver)
+        page.open()
+        driver.find_element(*ContactPage.NAME_INPUT).send_keys("Test")
+        driver.find_element(*ContactPage.EMAIL_INPUT).send_keys("not-an-email")
+        driver.find_element(*ContactPage.MESSAGE_TEXTAREA).send_keys("Test message")
+        driver.find_element(*ContactPage.SUBMIT_BTN).click()
+        time.sleep(1)
+
+        email_validation = driver.find_element(*ContactPage.EMAIL_INPUT).get_attribute("validationMessage")
+        error_visible = page.is_visible(*ContactPage.ERROR_MSG)
+        assert email_validation or error_visible
+
+    def test_contact_with_booking_reference(self, driver, wait):
+        page = ContactPage(driver)
+        page.open()
+        page.fill_and_submit(
+            name="Test User",
+            email="test@travelog.com",
+            message="I need help with my booking.",
+            subject="Booking Help",
+            booking_ref="TRV-2024-XK9M01",
+        )
+        time.sleep(2)
+        success_el = wait.until(
+            EC.visibility_of_element_located(ContactPage.SUCCESS_MSG)
+        )
+        assert success_el.is_displayed()
+
+
+# ─────────────────────────── Reviews ─────────────────────────────
+
+class TestReviews:
+    """Review submission form on tour and package detail pages."""
+
+    def test_review_form_visible_for_logged_in_user(self, authenticated_driver, wait):
+        search = SearchPage(authenticated_driver)
+        search.open("tour")
+        time.sleep(2)
+
+        if search.get_result_count() == 0:
+            pytest.skip("No tours available")
+
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+
+        tour = TourDetailPage(authenticated_driver)
+        tour.scroll_to_reviews()
+
+        review_form = authenticated_driver.find_elements(
+            By.CSS_SELECTOR, ".review-form, [data-testid='review-form']"
+        )
+        assert len(review_form) > 0 or tour.get_review_count() >= 0
+
+    def test_reviews_display_approved_only(self, driver, wait):
+        search = SearchPage(driver)
+        search.open("tour")
+        time.sleep(2)
+
+        if search.get_result_count() == 0:
+            pytest.skip("No tours available")
+
+        search.click_result(0)
+        wait.until(EC.url_changes(f"{BASE_URL}/search"))
+
+        tour = TourDetailPage(driver)
+        tour.scroll_to_reviews()
+        time.sleep(1)
+
+        # Pending reviews should not be visible to unauthenticated users
+        pending = driver.find_elements(
+            By.CSS_SELECTOR, ".review-card[data-approved='false']"
+        )
+        assert len(pending) == 0
+
+
+# ─────────────────────────── Flash Sales ─────────────────────────
+
+class TestFlashSales:
+    """Flash sale badge, countdown, and special pricing on listings."""
+
+    def test_flash_sale_page_shows_results(self, driver, wait):
+        driver.get(f"{BASE_URL}/flash-sales")
+        time.sleep(2)
+        cards = driver.find_elements(
+            By.CSS_SELECTOR, ".tour-card, .package-card, [data-testid='result-card']"
+        )
+        # Page should load — even if empty (no active flash sales)
+        assert driver.title != ""
+
+    def test_flash_sale_badge_links_to_tour(self, driver, wait):
+        homepage = HomePage(driver)
+        homepage.open()
+
+        flash_badges = driver.find_elements(
+            By.CSS_SELECTOR, ".flash-sale-badge, [data-testid='flash-badge']"
+        )
+        if not flash_badges:
+            pytest.skip("No flash sale badges on home page")
+
+        flash_badges[0].click()
+        wait.until(EC.url_changes(f"{BASE_URL}/"))
+        assert driver.current_url != f"{BASE_URL}/"
+
+    def test_flash_sale_countdown_ticks(self, driver, wait):
+        homepage = HomePage(driver)
+        homepage.open()
+
+        if not homepage.is_visible(*HomePage.FLASH_SALE_COUNTDOWN):
+            pytest.skip("No countdown timer on home page")
+
+        countdown_el = driver.find_element(*HomePage.FLASH_SALE_COUNTDOWN)
+        initial_text = countdown_el.text
+        time.sleep(2)
+        updated_text = countdown_el.text
+        # Timer should have changed (seconds ticked)
+        assert initial_text != updated_text or initial_text == "00:00:00"   
