@@ -1,0 +1,458 @@
+name: Travelog CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs on the same branch to avoid wasted compute
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Non-secret env vars safe to hardcode in CI
+  APP_ENV: testing
+  DEBUG: "false"
+  SECRET_KEY: ci-test-secret-key-not-used-in-production
+  ALGORITHM: HS256
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+  REFRESH_TOKEN_EXPIRE_DAYS: "7"
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/travelog_test
+  REDIS_URL: redis://localhost:6379/0
+  AWS_REGION: ap-southeast-1
+  AWS_S3_BUCKET: travelog-media-test
+  EMAILS_FROM_EMAIL: noreply@travelog.com
+  EMAILS_FROM_NAME: Travelog
+  FRONTEND_URL: http://localhost:3000
+  WHATSAPP_BUSINESS_NUMBER: "60333855018"
+  DEFAULT_PAGE_SIZE: "20"
+  MAX_PAGE_SIZE: "100"
+  FLASH_SALE_CACHE_TTL: "300"
+
+# ─────────────────────────────────────────────────────────────────
+# JOB 1 — Lint & static analysis
+# ─────────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ruff mypy
+
+      - name: Run Ruff linter
+        run: ruff check . --output-format=github
+
+      - name: Run Ruff formatter check
+        run: ruff format --check .
+
+      - name: Run Mypy type check
+        run: mypy app/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true   # type errors are warnings until fully typed
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 2 — Security scan
+  # ─────────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install security tools
+        run: pip install bandit safety pip-audit
+
+      - name: Run Bandit (SAST)
+        run: |
+          bandit -r app/ \
+            -x app/tests/ \
+            --severity-level medium \
+            --confidence-level medium \
+            -f json -o bandit-report.json || true
+          bandit -r app/ -x app/tests/ --severity-level medium --confidence-level medium
+
+      - name: Check dependencies for known CVEs (pip-audit)
+        run: pip-audit --requirement requirements.txt --output=json > pip-audit-report.json || pip-audit -r requirements.txt
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            pip-audit-report.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 3 — Tests (unit + integration)
+  # ─────────────────────────────────────────────────────────────────
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: travelog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run database migrations
+        run: |
+          alembic upgrade head
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+
+      - name: Run tests with coverage
+        run: |
+          pytest app/tests/ \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70 \
+            -v \
+            --asyncio-mode=auto \
+            --tb=short
+        env:
+          # Secrets available only in tests — use dummy values
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_TEST || 'sk-test-dummy' }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY_TEST || 'sk_test_dummy' }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET_TEST || 'whsec_test_dummy' }}
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          SMTP_USER: ""
+          SMTP_PASSWORD: ""
+          FPX_API_URL: http://localhost:9999
+          FPX_MERCHANT_ID: test_merchant
+          FPX_MERCHANT_KEY: test_key
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.11'   # only upload once
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 4 — Build & push Docker image  (only on push, not PRs)
+  # ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push'
+
+    permissions:
+      contents: read
+      id-token: write   # needed for OIDC auth to AWS ECR
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_uri: ${{ steps.build-push.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/travelog-api
+          tags: |
+            # branch push → short SHA
+            type=sha,prefix=,format=short
+            # main branch always gets "latest"
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # develop branch tag
+            type=raw,value=develop,enable=${{ github.ref == 'refs/heads/develop' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/travelog-api:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 5 — Deploy to Staging  (develop branch only)
+  # ─────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://api-staging.travelog.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run database migrations (staging)
+        run: |
+          pip install alembic psycopg2-binary
+          alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+
+      - name: Deploy to ECS (staging)
+        run: |
+          aws ecs update-service \
+            --cluster travelog-staging \
+            --service travelog-api \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for ECS service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster travelog-staging \
+            --services travelog-api \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Smoke test staging
+        run: |
+          sleep 15
+          curl --fail --retry 5 --retry-delay 5 \
+            https://api-staging.travelog.com/health \
+            -H "Accept: application/json"
+
+      - name: Notify Slack on staging deploy
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *Staging deploy ${{ job.status }}*\nBranch: `${{ github.ref_name }}` | Commit: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 6 — Deploy to Production  (main branch only, with approval)
+  # ─────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production          # configure required reviewers in GitHub → Environments
+      url: https://api.travelog.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run database migrations (production)
+        run: |
+          pip install alembic psycopg2-binary
+          alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+
+      - name: Deploy to ECS (production) — rolling update
+        run: |
+          aws ecs update-service \
+            --cluster travelog-production \
+            --service travelog-api \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for ECS service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster travelog-production \
+            --services travelog-api \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Smoke test production
+        run: |
+          sleep 15
+          curl --fail --retry 5 --retry-delay 10 \
+            https://api.travelog.com/health \
+            -H "Accept: application/json"
+
+      - name: Create GitHub release tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ github.sha }}
+          name: Production Release — ${{ github.sha }}
+          body: |
+            **Deployed:** ${{ github.event.head_commit.timestamp }}
+            **Commit:** ${{ github.sha }}
+            **Author:** ${{ github.actor }}
+
+            ${{ github.event.head_commit.message }}
+          generate_release_notes: true
+
+      - name: Notify Slack on production deploy
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🚀' || '🔥' }} *Production deploy ${{ job.status }}*\nCommit: `${{ github.sha }}` by @${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 7 — Rollback helper  (manual trigger only)
+  # ─────────────────────────────────────────────────────────────────
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Roll back ECS to previous task definition
+        run: |
+          CURRENT=$(aws ecs describe-services \
+            --cluster travelog-production \
+            --services travelog-api \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          FAMILY=$(echo $CURRENT | cut -d: -f6)
+          REVISION=$(echo $CURRENT | cut -d: -f7)
+          PREV=$((REVISION - 1))
+          echo "Rolling back from revision $REVISION to $PREV"
+          aws ecs update-service \
+            --cluster travelog-production \
+            --service travelog-api \
+            --task-definition "${FAMILY}:${PREV}" \
+            --region ${{ env.AWS_REGION }}
